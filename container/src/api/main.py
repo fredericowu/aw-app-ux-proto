@@ -97,7 +97,7 @@ def _startup() -> None:
     async def _reaper() -> None:
         while True:
             await asyncio.sleep(60)
-            supervisor.reap_idle()
+            await supervisor.reap_idle()
             await renderer.reap_if_idle()
 
     asyncio.get_event_loop().create_task(_reaper())
@@ -314,7 +314,13 @@ async def write_file(slug: str, body: _FileIn):
         projects_fs.write_file(slug, body.path, body.content)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    await _broadcast(slug, {"type": "reload"})
+    # Writing backend.py does NOT restart the subprocess by itself — only
+    # hot_reload_backend does. Broadcasting a reload here anyway forced the
+    # browser tab to hit the (possibly mid-respawn) proxy for no reason,
+    # which is how a normal edit/hot_reload_backend burst produced the
+    # intermittent "mock backend did not answer" 500.
+    if body.path != "backend.py":
+        await _broadcast(slug, {"type": "reload"})
     return {"ok": True, "path": body.path}
 
 
@@ -526,7 +532,7 @@ async def serve_html2canvas_by_host(request: Request):
 @app.post("/api/projects/{slug}/hot_reload_backend")
 async def hot_reload_backend(slug: str):
     _require_project(slug)
-    port = supervisor.reload(slug, projects_fs.backend_path(slug))
+    port = await supervisor.reload(slug, projects_fs.backend_path(slug))
     await _broadcast(slug, {"type": "backend_reloaded", "ok": port is not None})
     if port is None:
         return {"ok": False, "error": "backend.py failed to start — check for syntax errors"}

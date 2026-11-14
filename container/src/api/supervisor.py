@@ -21,10 +21,12 @@ broken project as a platform outage instead of a project bug.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import httpx
@@ -38,6 +40,14 @@ class BackendSupervisor:
         self._procs: dict[str, subprocess.Popen] = {}
         self._ports: dict[str, int] = {}
         self._last_used: dict[str, float] = {}
+        # Guards all three dicts above, and serializes spawn/kill so two
+        # concurrent calls for the same slug (e.g. a proxied request racing
+        # a hot_reload_backend) can't both decide the backend is missing and
+        # each spawn their own subprocess. ensure_running/reload/reap_idle
+        # run the blocking parts (Popen, the up-to-5s port-open wait,
+        # proc.wait) off the event loop via asyncio.to_thread, so holding
+        # this for that whole span never blocks other projects' requests.
+        self._lock = threading.Lock()
 
     def _free_port(self) -> int:
         used = set(self._ports.values())
@@ -66,12 +76,8 @@ class BackendSupervisor:
         self._last_used[slug] = time.time()
         return port
 
-    def ensure_running(self, slug: str, backend_path: str) -> int | None:
-        """Return the project's backend port, spawning it if needed.
-
-        Returns None if backend.py doesn't exist (project has no mock
-        backend) or the subprocess died and won't come back up.
-        """
+    def _ensure_running_locked(self, slug: str, backend_path: str) -> int | None:
+        """Body of ensure_running — caller must hold self._lock."""
         if not os.path.exists(backend_path):
             return None
 
@@ -93,33 +99,56 @@ class BackendSupervisor:
             time.sleep(0.1)
         return None
 
-    def reload(self, slug: str, backend_path: str) -> int | None:
-        """Force-restart this project's backend, isolated from all others."""
-        proc = self._procs.pop(slug, None)
-        self._ports.pop(slug, None)
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        return self.ensure_running(slug, backend_path)
+    def _ensure_running_sync(self, slug: str, backend_path: str) -> int | None:
+        with self._lock:
+            return self._ensure_running_locked(slug, backend_path)
 
-    def reap_idle(self) -> None:
+    async def ensure_running(self, slug: str, backend_path: str) -> int | None:
+        """Return the project's backend port, spawning it if needed.
+
+        Returns None if backend.py doesn't exist (project has no mock
+        backend) or the subprocess died and won't come back up. Runs off
+        the event loop (asyncio.to_thread) — the up-to-5s wait for a
+        (re)spawned subprocess's port to open no longer blocks every other
+        project's traffic on this worker.
+        """
+        return await asyncio.to_thread(self._ensure_running_sync, slug, backend_path)
+
+    def _reload_sync(self, slug: str, backend_path: str) -> int | None:
+        with self._lock:
+            proc = self._procs.pop(slug, None)
+            self._ports.pop(slug, None)
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            return self._ensure_running_locked(slug, backend_path)
+
+    async def reload(self, slug: str, backend_path: str) -> int | None:
+        """Force-restart this project's backend, isolated from all others."""
+        return await asyncio.to_thread(self._reload_sync, slug, backend_path)
+
+    def _reap_idle_sync(self) -> None:
         now = time.time()
-        for slug in list(self._procs):
-            if now - self._last_used.get(slug, now) > IDLE_TIMEOUT_SECONDS:
-                proc = self._procs.pop(slug)
-                self._ports.pop(slug, None)
-                self._last_used.pop(slug, None)
-                if proc.poll() is None:
-                    proc.terminate()
+        with self._lock:
+            for slug in list(self._procs):
+                if now - self._last_used.get(slug, now) > IDLE_TIMEOUT_SECONDS:
+                    proc = self._procs.pop(slug)
+                    self._ports.pop(slug, None)
+                    self._last_used.pop(slug, None)
+                    if proc.poll() is None:
+                        proc.terminate()
+
+    async def reap_idle(self) -> None:
+        await asyncio.to_thread(self._reap_idle_sync)
 
     async def proxy(self, slug: str, backend_path: str, subpath: str, request) -> tuple[int, bytes, dict]:
         """Proxy one request to the project's backend. Never raises a bare
         502/503/504 — callers get a (status, body, headers) tuple to build
         their own response, defaulting to 500 + JSON on any failure."""
-        port = self.ensure_running(slug, backend_path)
+        port = await self.ensure_running(slug, backend_path)
         if port is None:
             body = b'{"error":"project backend not running","slug":"%s"}' % slug.encode()
             return 500, body, {"content-type": "application/json"}
